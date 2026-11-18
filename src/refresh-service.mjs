@@ -12,7 +12,10 @@ import { join } from "node:path";
 import { readJson, writeJsonAtomic, createMutex } from "./atomic-json.mjs";
 import { CREDENTIAL_KEY } from "./shared.mjs";
 import { buildModelChange } from "./model-update.mjs";
-import { fetchLiveAvailableModelIds, parseAccessExpiryMs, refreshEphemeralAccess } from "./copilot-models.mjs";
+import { buildSupplementChange } from "./supplement-models.mjs";
+import { fetchLiveModelCatalog, parseAccessExpiryMs, refreshEphemeralAccess } from "./copilot-models.mjs";
+import { buildLiveCatalog } from "./live-catalog.mjs";
+import { mergeCatalog, normalizeRemoteCatalog } from "./catalog.mjs";
 
 const PREVIEW_TTL_MS = 10 * 60 * 1000;
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
@@ -98,12 +101,15 @@ export function createRefreshService(ctx, {
     }
     if (access) {
       try {
-        const ids = await fetchLiveAvailableModelIds({ credential: { ...payload, access }, fetchImpl });
+        const { ids, models, diagnostics } = await fetchLiveModelCatalog({ credential: { ...payload, access }, fetchImpl });
+        if (readIntentVersion() !== iv) throw flowError("AUTH_CHANGED", "authorization changed during model discovery");
         const fetchedAt = iso(clock.now()); // 单次取时：缓存值与返回值同源（避免毫秒漂移）
         mkdirSync(scope.dataDir, { recursive: true });
+        // Metadata remains in the preview's memory only. Persist account IDs, never raw API responses.
         writeJsonAtomic(cacheFile, { ids, fetchedAt, intentVersion: iv });
-        return { source: "live", ids, fetchedAt, stale: false, reason: null };
+        return { source: "live", ids, models, diagnostics, fetchedAt, stale: false, reason: null };
       } catch (error) {
+        if (error?.code === "AUTH_CHANGED") throw error;
         reason = error?.status === 401 || error?.status === 403 ? "token-rejected" : "network";
       }
     }
@@ -126,7 +132,10 @@ export function createRefreshService(ctx, {
     }
   }
 
-  function diffFromInputs({ operation, evidence, catalog, config, selectedIds, confirmEmpty, clearOverrides }) {
+  function diffFromInputs({ operation, evidence, catalog, config, selectedIds, confirmEmpty, clearOverrides, selectionMode }) {
+    if (selectionMode === "supplement" && selectedIds === undefined) {
+      return buildSupplementChange({ config, evidence, catalog });
+    }
     const diff = buildModelChange({
       operation,
       rawView: config.view,
@@ -155,7 +164,11 @@ export function createRefreshService(ctx, {
     for (const [id, snap] of snapshots) {
       if (nowTs > snap.expiresAt) snapshots.delete(id);
     }
-    const { operation, catalogSource, basePreviewId, selectedIds, confirmEmpty, clearOverrides } = body;
+    const { operation, catalogSource, basePreviewId, selectedIds, confirmEmpty, clearOverrides, selectionMode } = body;
+    if (selectionMode !== undefined && selectionMode !== "supplement") throw flowError("INVALID_REQUEST", "invalid-selection-mode");
+    if (selectionMode === "supplement" && (selectedIds !== undefined || clearOverrides === true)) {
+      throw flowError("INVALID_REQUEST", "supplement cannot remove models or clear customizations");
+    }
     if (operation !== "manage") {
       throw flowError("INVALID_OPERATION", "invalid-operation");
     }
@@ -166,12 +179,13 @@ export function createRefreshService(ctx, {
       if (clock.now() > base.expiresAt) throw flowError("PREVIEW_INVALID", "preview-invalid", { reason: "expired" });
       const diff = diffFromInputs({
         operation: base.operation, evidence: base.evidence, catalog: base.catalog,
-        config: base.config, selectedIds, confirmEmpty, clearOverrides,
+        config: base.config, selectedIds, confirmEmpty, clearOverrides, selectionMode,
       });
       const snap = {
         ...base,
         previewId: randomUUID(),
-        selectedIds: [...(selectedIds ?? [])],
+        selectedIds: [...diff.selectedIds],
+        selectionMode: selectionMode ?? null,
         confirmEmpty: confirmEmpty === true,
         clearOverrides: clearOverrides === true,
         diff,
@@ -182,18 +196,53 @@ export function createRefreshService(ctx, {
       snapshots.set(snap.previewId, snap);
       return projectPreview(snap);
     }
+    const expectedIntent = readIntentVersion();
     const evidence = await resolveAccountEvidence({ clock, fetchImpl: getFetch() });
-    const catalog = await resolveCatalog(catalogSource);
+    const staticCatalog = await resolveCatalog(catalogSource);
+    const existingIds = new Set(staticCatalog.resolvableIds ?? []);
+    const discovered = buildLiveCatalog({
+      models: evidence.source === "live" ? evidence.models : [],
+      availableIds: evidence.ids,
+      existingIds,
+    });
+    const normalizedLive = normalizeRemoteCatalog(discovered.catalog, {
+      allowedKeys: new Set(staticCatalog.allowedKeys ?? []),
+    });
+    const combinedOverlay = mergeCatalog(staticCatalog.addedOverlay ?? {}, normalizedLive.catalog);
+    const acceptedLive = combinedOverlay.added;
+    for (const { id } of acceptedLive) existingIds.add(id);
+    const rejected = new Map([...discovered.skipped, ...normalizedLive.skipped, ...combinedOverlay.skipped].map(({ id, reason }) => [id, reason]));
+    const catalog = {
+      ...staticCatalog,
+      addedOverlay: combinedOverlay.merged,
+      newEntryCount: (staticCatalog.newEntryCount ?? 0) + acceptedLive.length,
+      resolvableIds: [...existingIds],
+      provenance: {
+        ...staticCatalog.provenance,
+        ...(acceptedLive.length > 0 ? { liveAccount: { fetchedAt: evidence.fetchedAt, models: acceptedLive } } : {}),
+      },
+      discovery: {
+        source: evidence.source,
+        accountCount: evidence.ids.length,
+        resolvableCount: evidence.ids.filter((id) => existingIds.has(id)).length,
+        added: acceptedLive,
+        unresolved: evidence.ids.filter((id) => !existingIds.has(id)).map((id) => ({
+          id, reason: evidence.source !== "live" ? "live-metadata-unavailable" : rejected.get(id) ?? "metadata-unavailable",
+        })),
+      },
+    };
     const config = await describeConfigView();
     const intentVersion = readIntentVersion();
-    const diff = diffFromInputs({ operation, evidence, catalog, config, selectedIds, confirmEmpty, clearOverrides });
+    if (intentVersion !== expectedIntent) throw flowError("AUTH_CHANGED", "authorization changed during model discovery");
+    const diff = diffFromInputs({ operation, evidence, catalog, config, selectedIds, confirmEmpty, clearOverrides, selectionMode });
     const now = clock.now();
     const snap = {
       previewId: randomUUID(),
       createdAt: now,
       expiresAt: now + PREVIEW_TTL_MS,
       operation,
-      selectedIds: [...(selectedIds ?? [])],
+      selectedIds: [...diff.selectedIds],
+      selectionMode: selectionMode ?? null,
       confirmEmpty: confirmEmpty === true,
       clearOverrides: clearOverrides === true,
       hadModels: hadModelsOf(config),
@@ -219,6 +268,10 @@ export function createRefreshService(ctx, {
       evidence: { source: snap.evidence.source, fetchedAt: snap.evidence.fetchedAt, stale: snap.evidence.stale, reason: snap.evidence.reason ?? null },
       catalogSource: snap.catalog.catalogSource,
       catalogError: snap.catalog.catalogError ?? null,
+      provenance: snap.catalog.provenance ?? null,
+      discovery: snap.catalog.discovery ?? null,
+      selectionMode: snap.selectionMode ?? null,
+      automaticCatalog: snap.diff.automaticCatalog === true,
       skipped: snap.catalog.skipped ?? [],
       normalized: snap.catalog.normalized ?? null,
       hadModels: snap.hadModels === true,

@@ -65,6 +65,7 @@ export function validateCatalog(api, id, entry) {
   if (entry.id !== id) return `id mismatch: key=${id} entry.id=${entry.id}`;
   if (entry.api !== api) return `api mismatch: section=${api} entry.api=${entry.api}`;
   if (entry.provider !== "github-copilot") return `unexpected provider: ${entry.provider}`;
+  if (entry.type !== undefined && entry.type !== "chat") return `unsupported model type: ${entry.type}`;
   for (const field of ["contextWindow", "maxTokens"]) {
     if (typeof entry[field] !== "number" || !Number.isFinite(entry[field]) || entry[field] <= 0) {
       return `${field} must be a positive number`;
@@ -78,7 +79,17 @@ export function validateCatalog(api, id, entry) {
 // 已有 id（任一层）静默跳过——不覆盖、不进 added/skipped。
 export function mergeCatalog(local, remote) {
   const merged = {};
-  for (const [api, section] of Object.entries(local ?? {})) merged[api] = { ...(section ?? {}) };
+  for (const [api, section] of Object.entries(local ?? {})) {
+    merged[api] = {};
+    for (const [key, entry] of Object.entries(section ?? {})) {
+      // Normalize only recognizable chat entries. Unknown local data remains intact;
+      // persistence uses mergeCatalogForDisk so original serialized keys survive.
+      const id = key.startsWith(CHAT_KEY_PREFIX) ? key.slice(CHAT_KEY_PREFIX.length) : key;
+      const canonical = key.startsWith(CHAT_KEY_PREFIX) && validateCatalog(api, id, entry) === true
+        && (entry.type === undefined || entry.type === "chat") ? id : key;
+      if (!Object.hasOwn(merged[api], canonical)) merged[api][canonical] = entry;
+    }
+  }
   const have = new Set(Object.values(merged).flatMap((s) => Object.keys(s)));
   const added = [];
   const skipped = [];
@@ -96,6 +107,32 @@ export function mergeCatalog(local, remote) {
       added.push({ id, api });
       have.add(id);
     }
+  }
+  return { merged, added, addedOverlay, skipped };
+}
+
+// Serialize only the accepted increment into the ORIGINAL disk document. Never
+// rewrite old keys, erase non-chat catalogs, or flatten unknown local metadata.
+export function mergeCatalogForDisk(local, remote) {
+  const logical = mergeCatalog(local, remote);
+  const merged = structuredClone(local ?? {});
+  const modern = Object.values(local ?? {}).some((section) => section && typeof section === "object"
+    && Object.keys(section).some((key) => /^(chat|image|classifier):/.test(key)));
+  const added = [];
+  const addedOverlay = {};
+  const skipped = [...logical.skipped];
+  for (const { api, id } of logical.added) {
+    const entry = logical.addedOverlay[api][id];
+    const section = merged[api];
+    const key = modern ? `${CHAT_KEY_PREFIX}${id}` : id;
+    if (section !== undefined && (!section || typeof section !== "object" || Array.isArray(section)
+      || Object.hasOwn(section, key))) {
+      skipped.push({ api, id, reason: "local catalog key occupied; preserved without overwrite" });
+      continue;
+    }
+    (merged[api] ??= {})[key] = modern ? { ...entry, type: "chat" } : entry;
+    (addedOverlay[api] ??= {})[id] = entry;
+    added.push({ api, id });
   }
   return { merged, added, addedOverlay, skipped };
 }
@@ -130,6 +167,10 @@ export function normalizeRemoteCatalog(data, { allowedKeys } = {}) {
       }
       if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
         skipped.push({ api, id, reason: "entry is not an object" });
+        continue;
+      }
+      if (entry.type !== undefined && entry.type !== "chat") {
+        skipped.push({ api, id, reason: `unsupported model type: ${entry.type}` });
         continue;
       }
       if (typeof entry.id === "string" && entry.id !== id) {

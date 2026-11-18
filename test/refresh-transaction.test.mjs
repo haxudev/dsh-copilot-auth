@@ -97,6 +97,28 @@ function makeSnapshot(w, {
 
 const diskHas = (w, id) => Object.values(JSON.parse(readFileSync(w.catalogFile, "utf8"))).some((s) => id in s);
 
+test("TX_MODERN：现代目录只增持久化保留 chat 键及未知条目，boot 以裸 ID 恢复", async () => {
+  const w = makeWorld({ version: "1.3.0" });
+  const raw = {
+    "openai-completions": { "chat:keep-1": { ...BASE_CATALOG["openai-completions"]["keep-1"], type: "chat", custom: "keep" } },
+    "future-api": { "classifier:x": { id: "x", type: "classifier", opaque: true } },
+  };
+  writeFileSync(w.catalogFile, JSON.stringify(raw));
+  const result = await w.makeTx().runApply({ snapshot: makeSnapshot(w) });
+  assert.equal(result.result.status, "pending-restart");
+  const disk = JSON.parse(readFileSync(w.catalogFile, "utf8"));
+  assert.deepEqual(disk["openai-completions"]["chat:keep-1"], raw["openai-completions"]["chat:keep-1"]);
+  assert.equal(disk["openai-completions"]["chat:new-1"].type, "chat");
+  assert.equal(disk["openai-completions"]["new-1"], undefined);
+  assert.deepEqual(disk["future-api"], raw["future-api"]);
+  const boot = await w.makeTx().bootRecover();
+  assert.equal(boot.status, "applied");
+  assert.deepEqual(w.settings.userLayer.providers["github-copilot"].models, [{ id: "keep-1" }, { id: "new-1" }]);
+  const before = readFileSync(w.catalogFile, "utf8");
+  await w.makeTx().bootRecover();
+  assert.equal(readFileSync(w.catalogFile, "utf8"), before, "重复恢复不改写现代目录");
+});
+
 test("TX_PREPARE：prepared 持久失败 → 零副作用（目录零写入、mutate 零调用、无 activeOperation）", async () => {
   const w = makeWorld();
   const before = readFileSync(w.catalogFile, "utf8");

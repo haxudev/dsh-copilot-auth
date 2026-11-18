@@ -3,7 +3,7 @@
 // 通道门控（blocked/unknown/scope 不可用）。
 import test from "node:test";
 import assert from "node:assert/strict";
-import { initial, reduce, advance, refreshBlocked } from "../src/refresh-flow.mjs";
+import { initial, reduce, advance, refreshBlocked, discoveryView } from "../src/refresh-flow.mjs";
 import { PROTOCOL_VERSION } from "../src/shared.mjs";
 
 const jsonResponse = (spec) => ({
@@ -549,4 +549,129 @@ test("Q6 用例 J：终态残留组合（active=null + lastResult=conflict + res
   assert.equal(s0.name, "pendingRestart", "宿主 pendingRestart=true 组合仍落 pendingRestart（1.2.21 既有语义，台账 Q6 仅备注不扩修）");
   const s1 = reduce(s0, { type: "retire-request" })[0];
   assert.equal(s1.name, "pendingRestart", "终态残留（result 非 pending-restart、无 active）不给放弃出口");
+});
+
+
+// ---- v1.3.0-local.1：补充入口仍是 manage，只设置初始目标，不绕过预览确认 ----
+// 共享 start 的全部入口：idle/failed/result/pendingRestart/busy/resultUnknown。
+// busy/pendingRestart/result 原有 apply-ok、hydrate、query-result、retire 闭环继续由上方用例覆盖；
+// 此处逐入口验证新增模式不会污染旧的 manage 请求或直接发起 apply。
+test("supplement start：全部入口携补充模式，manage 默认不携带，绝不自动 apply", async () => {
+  for (const name of ["idle", "failed", "result", "pendingRestart", "busy", "resultUnknown"]) {
+    const f = makeFetch();
+    const body = { ...previewBody({ selectedIds: ["a", "b", "c"] }), provenance: { piAiVersion: "0.99.0" } };
+    f.respond(P, { body });
+    let s = await advance({ ...initial, name }, { type: "start", selectionMode: "supplement" }, f);
+    assert.equal(s.name, "confirming", name);
+    assert.equal(s.selectionMode, "supplement", name);
+    assert.deepEqual(s.preview.provenance, body.provenance);
+    assert.deepEqual(f.bodies[0].body, { protocolVersion: PROTOCOL_VERSION, operation: "manage", selectionMode: "supplement" });
+    assert.equal(f.calls.includes(A), false, "补充必须仍等待用户确认");
+    s = await advance(s, { type: "cancel" }, f);
+    assert.equal(s.selectionMode, undefined);
+    await advance(s, { type: "start" }, f);
+    assert.deepEqual(f.bodies.at(-1).body, { protocolVersion: PROTOCOL_VERSION, operation: "manage" });
+  }
+});
+
+test("supplement：确认后 apply 仍仅发送预览绑定 id；过期重预览保留默认补充模式", async () => {
+  const f = makeFetch();
+  f.respond(P, { body: previewBody({ selectedIds: ["a", "b"] }) });
+  let s = await advance(initial, { type: "start", selectionMode: "supplement" }, f);
+  f.respondOnce(A, { status: 409, body: { ok: false, error: "preview-stale" } });
+  s = await advance(s, { type: "confirm" }, f);
+  assert.equal(s.name, "confirming");
+  assert.equal(s.selectionMode, "supplement");
+  assert.equal(f.bodies.filter((x) => x.url === P).at(-1).body.selectionMode, "supplement");
+  f.respond(A, { body: { ok: true, result: { status: "applied" } } });
+  s = await advance(s, { type: "confirm" }, f);
+  assert.equal(s.name, "result");
+  assert.deepEqual(f.bodies.filter((x) => x.url === A).at(-1).body, {
+    protocolVersion: PROTOCOL_VERSION, previewId: "pv-1", operationId: "op-1",
+  });
+});
+
+test("supplement：显式编辑使用快照 selectedIds，清除补充默认；切源保留未编辑的补充默认", async () => {
+  const f = makeFetch();
+  f.respond(P, { body: previewBody({ selectedIds: ["a", "b"] }) });
+  let s = await advance(initial, { type: "start", selectionMode: "supplement" }, f);
+  f.respond(P, { body: previewBody({ catalogSource: "overlay" }) });
+  s = await advance(s, { type: "start", catalogSource: "overlay" }, f);
+  assert.equal(s.selectionMode, "supplement");
+  assert.equal(f.bodies.at(-1).body.selectionMode, "supplement");
+  assert.equal(f.bodies.at(-1).body.catalogSource, "overlay");
+  s = await advance(s, { type: "select", selectedIds: ["a"], clearOverrides: false }, f);
+  assert.equal(s.selectionMode, undefined, "手动选择后不再声称仅补充");
+  assert.deepEqual(f.bodies.at(-1).body, {
+    protocolVersion: PROTOCOL_VERSION, operation: "manage", catalogSource: "overlay",
+    basePreviewId: "pv-1", selectedIds: ["a"], clearOverrides: false,
+  });
+});
+
+test("supplement：自动全目录模式拒绝 select，避免写入显式列表与清除定制", async () => {
+  const f = makeFetch();
+  f.respond(P, { body: { ...previewBody(), automaticCatalog: true } });
+  let s = await advance(initial, { type: "start", selectionMode: "supplement" }, f);
+  const before = s;
+  s = await advance(s, { type: "select", selectedIds: [], clearOverrides: true, confirmEmpty: true }, f);
+  assert.equal(s, before);
+  assert.equal(f.bodies.length, 1, "不应 materialize 自动全目录预览");
+});
+
+test("supplement：自动 live 升级保留默认；硬失败回退只用快照而不重设选择", async () => {
+  const f = makeFetch();
+  f.respondOnce(P, { body: withRemoval({ evidence: { source: "cache", stale: false } }) });
+  f.respondOnce(P, { status: 500, body: { ok: false, errorCode: "live-failed" } });
+  f.respond(P, { body: withRemoval() });
+  const s = await advance(initial, { type: "start", selectionMode: "supplement" }, f);
+  assert.equal(s.name, "confirming");
+  assert.equal(s.selectionMode, "supplement");
+  const bodies = f.bodies.map((x) => x.body);
+  assert.equal(bodies[1].selectionMode, "supplement", "新鲜 live 预览沿用默认补充");
+  assert.equal(bodies[1].basePreviewId, undefined);
+  assert.equal(bodies[2].basePreviewId, "pv-1");
+  assert.equal(bodies[2].selectionMode, undefined, "快照回退不得重新计算补充默认");
+  assert.equal(f.calls.includes(A), false);
+});
+
+
+// v1.4：账号发现展示不得把旧静态目录交集(12)误报为账号全集(18)。
+test("discovery：18 个账号模型与 12 条旧目录行独立计数，实时补目录 6 条", async () => {
+  const added = Array.from({ length: 6 }, (_, i) => ({ id: "live-" + i, api: "openai-completions" }));
+  const discovery = { accountCount: 18, resolvableCount: 18, added, unresolved: [], source: "live" };
+  const f = makeFetch();
+  f.respond(P, { body: { ...previewBody({ rows: Array.from({ length: 12 }, (_, i) => row("static-" + i, "listed")) }), discovery } });
+  const s = await advance(initial, { type: "start", selectionMode: "supplement" }, f);
+  assert.equal(s.name, "confirming");
+  const view = discoveryView(s.preview);
+  assert.equal(view.accountCount, 18);
+  assert.equal(view.resolvableCount, 18);
+  assert.equal(view.added.length, 6);
+  assert.equal(view.source, "live");
+  assert.equal(s.preview.rows.length, 12, "展示账号总数不能使用 rows.length");
+  assert.equal(f.calls.includes(A), false, "新增发现也不绕过确认");
+});
+
+test("discovery：cache/stale 来源与未接入原因原样保留，不冒充实时补目录", () => {
+  for (const source of ["cache", "stale"]) {
+    const unresolved = [{ id: "unsupported", reason: "unsupported-endpoint" }];
+    const view = discoveryView({ discovery: { accountCount: 18, resolvableCount: 12, added: [], unresolved, source } });
+    assert.equal(view.accountCount, 18);
+    assert.equal(view.resolvableCount, 12);
+    assert.equal(view.source, source);
+    assert.deepEqual(view.unresolved, unresolved);
+  }
+});
+
+test("discovery：旧服务不伪造账号数；缺失、负数、字符串计数为 unknown，不从行数补齐", () => {
+  assert.equal(discoveryView({ rows: Array(12).fill({}) }), null);
+  for (const value of [undefined, -1, "18", NaN, Infinity, 1.5]) {
+    const view = discoveryView({ discovery: { accountCount: value, resolvableCount: value, source: "future-source" }, rows: Array(12).fill({}) });
+    assert.equal(view.accountCount, null);
+    assert.equal(view.resolvableCount, null);
+    assert.equal(view.source, "unknown");
+    assert.deepEqual(view.added, []);
+    assert.deepEqual(view.unresolved, []);
+  }
+  assert.equal(discoveryView({ discovery: { accountCount: 0, resolvableCount: 0, source: "live" } }).accountCount, 0, "真实 0 必须保留");
 });

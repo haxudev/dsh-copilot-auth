@@ -434,6 +434,40 @@ function makeRefreshCtx(script = {}, opts = {}) {
 
 const post = (ctx, suffix, body) => call(handler(ctx, suffix), { method: "POST", body });
 
+test("MODERN_HOST: local chat keys neither duplicate latest models nor break local fallback", async () => {
+  for (const npm of ["ok", "fail"]) {
+    const inst = makeInstall();
+    const entry = JSON.parse(FIXTURE_0844)["openai-completions"]["gpt-a"];
+    writeFileSync(inst.catalogFile, JSON.stringify({ "openai-completions": { "chat:gpt-a": { ...entry, type: "chat" } } }));
+    const ctx = makeCtx({
+      record: { "llm-pi-ai/github-copilot": { kind: "grant", payload: { access: INDIVIDUAL_TOKEN } } },
+      userLayer: { providers: { "github-copilot": { models: [{ id: "gpt-a", maxTokens: 777 }] } } },
+    }, {
+      catalogFile: inst.catalogFile,
+      fetchImpl: fetchImplFor({ live: "ok", npm, latestCatalog: { "openai-completions": { "chat:gpt-a": { ...entry, type: "chat" } } }, modelsData: [pickerOn("gpt-a")] }),
+    });
+    const p = await post(ctx, "/refresh/preview", { protocolVersion: PROTOCOL_VERSION, operation: "manage", selectionMode: "supplement" });
+    assert.equal(p.code, 200);
+    assert.equal(p.body.catalogSource, npm === "ok" ? "latest" : "local");
+    assert.equal(p.body.catalogNewEntries, 0);
+    assert.deepEqual(p.body.diff.selectedIds, ["gpt-a"]);
+    assert.deepEqual(p.body.diff.targetView.models, [{ id: "gpt-a", maxTokens: 777 }]);
+    assert.equal((await call(handler(ctx, "/status"))).body.pluginVersion, "1.4.1-local.1");
+  }
+});
+
+test("AUTO_HOST: base-only route refreshes snapshot without materializing a model list", async () => {
+  const ctx = makeRefreshCtx({ applyOps: true, userLayer: undefined, valueLayer: { providers: { "github-copilot": { displayName: "GitHub Copilot" } } } }, { writableProbe: () => false, injectRegistry: async () => ({ ok: true }) });
+  ctx.llm.listModels = async () => ctx.settings.mutateCalls.length > 0 ? [{ id: "gpt-a" }, { id: "gpt-b" }] : [{ id: "gpt-a" }];
+  const p = await post(ctx, "/refresh/preview", { protocolVersion: PROTOCOL_VERSION, operation: "manage", selectionMode: "supplement" });
+  assert.equal(p.body.automaticCatalog, true);
+  const applied = await post(ctx, "/refresh/apply", { protocolVersion: PROTOCOL_VERSION, previewId: p.body.previewId, operationId: p.body.operationId });
+  assert.equal(applied.body.result.status, "applied");
+  assert.equal(ctx.settings.mutateCalls.length, 2, "temporary display name and restoration only");
+  assert.deepEqual(ctx.script.userLayer.providers["github-copilot"], {});
+  assert.equal(ctx.script.userLayer.providers["github-copilot"].models, undefined);
+});
+
 test("REFRESH_V2_协议门禁：缺 protocolVersion → 400 upgrade-required；未知 catalogSource → 400", async () => {
   const ctx = makeRefreshCtx();
   const noProto = await post(ctx, "/refresh/preview", { operation: "manage" });

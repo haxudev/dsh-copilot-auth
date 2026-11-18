@@ -1,7 +1,7 @@
 {
   "name": "@inventec/dsh-copilot-auth",
-  "version": "1.2.26",
-  "description": "为内置 Copilot 提供方补设备码登录设置页，预置开箱路由；凭据入内置凭据库，模型目录兜底不覆盖定制。v1.2.19：管理模型列表 v3 目标状态编辑（分组全表/挽留/对齐/清空语义告知）＋单次确认＋移除请求撤回＋退出残影修复。v1.2.18：授权失败附网络失败码＋人性化提示。适配 DSH 0.1.7+（≤0.1.5 请用 1.1.x）。v1.2.21：移除前实时证据自动续期（ephemeral 不落库＋负缓存 5min）＋缓存证据原因分型文案＋busy 卡死 retire 出口与水合判序修正（032）。",
+  "version": "1.4.1-local.1",
+  "description": "GitHub Copilot 本地升级版：设备码登录、实时账号能力驱动的新模型目录、只增预览同步与未解析原因、chat: 兼容、全目录及定制保护。基于上游 1.2.26，静态 pi-ai 1.5.2 之外受限接入 GPT-6.2 Sol / Gemini 4 Carbon / MAI Code 2 / MAI Code 2 Flash；权限与推理仍受账号及宿主协议限制。",
   "icon": "./icon.svg",
   "type": "module",
   "license": "MIT",
@@ -31,6 +31,7 @@
     "src/catalog-registry.mjs",
     "src/catalog-fetch.mjs",
     "src/copilot-models.mjs",
+    "src/live-catalog.mjs",
     "src/atomic-json.mjs",
     "src/state.mjs",
     "src/refresh-flow.mjs",
@@ -42,6 +43,9 @@
     "src/refresh-service.mjs",
     "src/refresh-transaction.mjs",
     "src/catalog-overlay.json",
+    "src/supplement-models.mjs",
+    "src/model-tool.mjs",
+    "docs/LOCAL-UPGRADE.md",
     "icon.svg"
   ],
   "scripts": {

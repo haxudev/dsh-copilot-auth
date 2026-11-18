@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "GitHub Copilot 授权（@inventec/dsh-copilot-auth）",
-    "description": "GitHub Copilot 订阅账号的设备码授权登录与模型目录管理入口。"
+    "description": "GitHub Copilot 订阅账号的设备码授权登录与模型目录管理入口。预览实时账号发现的模型、目录接入覆盖及未接入原因，保留现有模型与定制。"
   }
 }

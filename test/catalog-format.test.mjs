@@ -2,11 +2,57 @@
 // 0.87.x 用裸 id 键；本文件锁定「两个世代归一到同一语义」这一契约。
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { normalizeRemoteCatalog, catalogShapeKeys, trimEntryToShape, mergeCatalog, CHAT_KEY_PREFIX } from "../src/catalog.mjs";
+import { normalizeRemoteCatalog, catalogShapeKeys, trimEntryToShape, mergeCatalog, mergeCatalogForDisk, CHAT_KEY_PREFIX } from "../src/catalog.mjs";
 
 const ENTRY = (id, api, extra = {}) => ({
   id, api, provider: "github-copilot", baseUrl: "https://api.individual.githubcopilot.com",
   contextWindow: 128000, maxTokens: 8192, input: ["text"], ...extra,
+});
+
+test("本机 chat: 键按裸 ID 去重，不误报新增、不覆盖定制", () => {
+  const old = ENTRY("gpt-a", "openai-responses", { type: "chat", custom: "keep" });
+  const local = { "openai-responses": { "chat:gpt-a": old } };
+  const result = mergeCatalog(local, { "openai-responses": { "gpt-a": { ...old, maxTokens: 999 } } });
+  assert.deepEqual(result.added, []);
+  assert.deepEqual(result.merged["openai-responses"]["gpt-a"], old);
+  assert.equal(local["openai-responses"]["chat:gpt-a"], old);
+});
+
+test("可写现代目录保留原键、非 chat 与未知数据，仅新增 chat: 键及 type", () => {
+  const local = {
+    "openai-responses": { "chat:gpt-a": ENTRY("gpt-a", "openai-responses", { type: "chat", custom: 7 }), "future:opaque": { unknown: true } },
+    "future-api": { "classifier:x": { id: "x", type: "classifier", opaque: [1, 2] } },
+    "future-section": "opaque",
+  };
+  const before = structuredClone(local);
+  const remote = { "openai-responses": { "gpt-a": ENTRY("gpt-a", "openai-responses"), "gpt-b": ENTRY("gpt-b", "openai-responses") } };
+  const out = mergeCatalogForDisk(local, remote);
+  assert.deepEqual(out.added, [{ api: "openai-responses", id: "gpt-b" }]);
+  assert.deepEqual(out.merged["openai-responses"]["chat:gpt-a"], before["openai-responses"]["chat:gpt-a"]);
+  assert.equal(out.merged["openai-responses"]["chat:gpt-b"].type, "chat");
+  assert.equal(out.merged["openai-responses"]["gpt-b"], undefined);
+  assert.deepEqual(out.merged["future-api"], before["future-api"]);
+  assert.equal(out.merged["future-section"], "opaque");
+  assert.deepEqual(out.merged["openai-responses"]["future:opaque"], { unknown: true });
+  assert.deepEqual(local, before);
+  assert.deepEqual(mergeCatalogForDisk(out.merged, remote).added, []);
+});
+
+test("旧目录新增仍用裸键，未知占用键绝不覆盖", () => {
+  const entry = ENTRY("gpt-b", "openai-responses");
+  assert.deepEqual(mergeCatalogForDisk({}, { "openai-responses": { "gpt-b": entry } }).merged, { "openai-responses": { "gpt-b": entry } });
+  const local = { "openai-responses": { "chat:gpt-b": { opaque: true } } };
+  const result = mergeCatalogForDisk(local, { "openai-responses": { "gpt-b": entry } });
+  assert.deepEqual(result.merged, local);
+  assert.deepEqual(result.added, []);
+  assert.equal(result.skipped.length, 1);
+});
+
+test("非 chat 类型不参与模型可解析集合", () => {
+  const raw = { "openai-responses": { "image-a": ENTRY("image-a", "openai-responses", { type: "image" }) } };
+  const out = normalizeRemoteCatalog(raw);
+  assert.deepEqual(out.catalog, {});
+  assert.match(out.skipped[0].reason, /unsupported model type/);
 });
 
 test("0.87.x 裸键目录：原样通过，renamed=0", () => {

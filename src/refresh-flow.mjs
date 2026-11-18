@@ -34,7 +34,25 @@ const fromRefresh = (state, refresh) => ({
   lastResult: refresh?.lastResult ?? null,
 });
 
+// 展示专用投影：账号总数由 discovery 明确报告，绝不从可解析 rows 的交集反推。
+// 缺失/无效的计数保持 unknown(null)，避免旧服务或降级响应被展示为“账号只有 0 个”。
+export function discoveryView(preview) {
+  const d = preview?.discovery;
+  if (!d || typeof d !== "object") return null;
+  const count = (value) => Number.isSafeInteger(value) && value >= 0 ? value : null;
+  return {
+    accountCount: count(d.accountCount),
+    resolvableCount: count(d.resolvableCount),
+    added: Array.isArray(d.added) ? d.added : [],
+    unresolved: Array.isArray(d.unresolved) ? d.unresolved : [],
+    source: ["live", "cache", "stale"].includes(d.source) ? d.source : "unknown",
+  };
+}
+
 const restartStates = new Set(["pending-restart"]);
+
+// 只在默认补充意图仍有效时发送；用户手动编辑后改用显式选择。
+const supplementFields = (state) => state.selectionMode === "supplement" ? { selectionMode: "supplement" } : {};
 
 // 通道门控（T10 status refresh 块 → T11 入口禁用）：catalogMode ∈ file/registry/blocked/unknown。
 // file/registry 可操作；blocked/unknown 或 scope 不可用 → 不承诺可应用，入口禁用（G02／设计§4.3）。
@@ -65,12 +83,13 @@ function upgradeCandidate(state) {
     type: "preview",
     operation: p.operation,
     catalogSource: p.catalogSource,
+    ...supplementFields(state),
     ...selectionFields(state.lastSelection),
   };
 }
 
 // 进入 confirming（两条 preview-ok 迁移路径共用）：先落确认基态，再评估自动升级。
-function enterConfirming({ flags, preview, staleNotice, lastSelection }) {
+function enterConfirming({ flags, preview, staleNotice, lastSelection, selectionMode }) {
   const state = {
     name: "confirming",
     flags: flags ?? initial.flags,
@@ -80,6 +99,7 @@ function enterConfirming({ flags, preview, staleNotice, lastSelection }) {
     awaitingUpgrade: false,
     liveUpgradeUsed: false,
     lastSelection: lastSelection ?? {},
+    ...supplementFields({ selectionMode }),
   };
   const effect = upgradeCandidate(state);
   if (!effect) return [state, null];
@@ -102,7 +122,8 @@ export function reduce(state, event) {
           operation: "manage",
           catalogSource: event.catalogSource,
           stale: false,
-        }, { type: "preview", operation: "manage", catalogSource: event.catalogSource }];
+          ...supplementFields(event),
+        }, { type: "preview", operation: "manage", catalogSource: event.catalogSource, ...supplementFields(event) }];
       }
       if (event.type === "init" && state.name === "idle") return [state, { type: "status" }];
       if (event.type === "check" && state.name === "resultUnknown") {
@@ -151,7 +172,7 @@ export function reduce(state, event) {
     }
     case "previewing": {
       if (event.type === "preview-ok") {
-        return enterConfirming({ flags: state.flags ?? initial.flags, preview: event.preview, staleNotice: state.stale === true });
+        return enterConfirming({ flags: state.flags ?? initial.flags, preview: event.preview, staleNotice: state.stale === true, ...supplementFields(state) });
       }
       if (event.type === "preview-fail") return [{ name: "failed", flags: state.flags ?? initial.flags, error: event.error }, null];
       return [state, null];
@@ -159,6 +180,8 @@ export function reduce(state, event) {
     case "confirming": {
       const p = state.preview;
       if (event.type === "select") {
+        // 全目录自动模式只能补目录；切换为显式列表需使用原管理入口。
+        if (p.automaticCatalog === true) return [state, null];
         const lastSelection = { ...selectionFields({
           selectedIds: event.selectedIds,
           clearOverrides: event.clearOverrides,
@@ -195,6 +218,7 @@ export function reduce(state, event) {
           awaitingUpgrade: false,
           liveUpgradeUsed: state.liveUpgradeUsed ?? false,
           lastSelection: state.lastSelection ?? {},
+          ...supplementFields(state),
           staleNotice: (wasUpgrade && event.preview?.evidence?.source !== "live") || state.staleNotice === true,
         };
         const effect = upgradeCandidate(landed);
@@ -213,6 +237,7 @@ export function reduce(state, event) {
             awaitingUpgrade: false,
             liveUpgradeUsed: state.liveUpgradeUsed ?? true,
             lastSelection: state.lastSelection ?? {},
+            ...supplementFields(state),
             staleNotice: true,
           }, {
             type: "preview",
@@ -234,15 +259,16 @@ export function reduce(state, event) {
           awaitingUpgrade: false,
           liveUpgradeUsed: state.liveUpgradeUsed ?? false,
           lastSelection: state.lastSelection ?? {},
+          ...supplementFields(state),
           staleNotice: state.staleNotice,
-        }, { type: "preview", operation: p.operation, catalogSource: event.catalogSource }];
+        }, { type: "preview", operation: p.operation, catalogSource: event.catalogSource, ...supplementFields(state) }];
       }
       if (event.type === "confirm") {
         if (state.materializing) return [state, null]; // 物化/升级在途不得用旧 previewId 应用
         if (p.evidence?.stale === true) return [state, null]; // stale 证据不可应用（Q7）
         // 单次确认（Q37 用户裁决）：破坏性意图已由固定底栏常驻风险线在操作前完整告知，
         // 不再要求二次点击；证据门（removals-need-live）由服务端独立兜底
-        return [{ name: "applying", flags: state.flags ?? initial.flags, preview: p }, { type: "apply", previewId: p.previewId, operationId: p.operationId }];
+        return [{ name: "applying", flags: state.flags ?? initial.flags, preview: p, ...supplementFields(state) }, { type: "apply", previewId: p.previewId, operationId: p.operationId }];
       }
       if (event.type === "cancel") return [{ ...initial, flags: state.flags ?? initial.flags, lastResult: state.lastResult ?? null }, null];
       return [state, null];
@@ -261,7 +287,8 @@ export function reduce(state, event) {
           operation: state.preview.operation,
           catalogSource: state.preview.catalogSource,
           stale: true,
-        }, { type: "preview", operation: state.preview.operation, catalogSource: state.preview.catalogSource }];
+          ...supplementFields(state),
+        }, { type: "preview", operation: state.preview.operation, catalogSource: state.preview.catalogSource, ...supplementFields(state) }];
       }
       if (event.type === "apply-busy") {
         return [{ ...state, name: "checking" }, { type: "status" }];
@@ -332,6 +359,7 @@ export async function runEffect(effect, fetchImpl) {
     // 选择字段按在场性组装（R1-9）：初始预览不带；materialize/升级/回退按 effect 实际字段携带
     const res = await post(r.refreshPreview, {
       operation: effect.operation,
+      ...supplementFields(effect),
       ...(effect.catalogSource ? { catalogSource: effect.catalogSource } : {}),
       ...(effect.basePreviewId !== undefined ? { basePreviewId: effect.basePreviewId } : {}),
       ...(effect.selectedIds !== undefined ? { selectedIds: effect.selectedIds } : {}),

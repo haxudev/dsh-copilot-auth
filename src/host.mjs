@@ -17,12 +17,16 @@ import { injectCatalogEntries, registryModelIds, registryVia, registryInstanceMi
 import { loadRefreshState, saveRefreshState } from "./state.mjs";
 import { createRefreshService } from "./refresh-service.mjs";
 import { createTransaction } from "./refresh-transaction.mjs";
+import { registerModelTool } from "./model-tool.mjs";
+
+export const PLUGIN_VERSION = "1.4.1-local.1";
 
 export const name = "copilot-auth";
 export const inject = ["webServer", "authorization", "credentials", "settings", "llm"];
 
 // 内置覆盖层的收割来源版本（integrity 记录于 README「模型目录刷新」章节）
-const OVERLAY_SOURCE_VERSION = "0.85.1";
+const OVERLAY_SOURCE_VERSION = "1.5.2";
+const OVERLAY_SOURCE_INTEGRITY = "sha512-2tWPSnV3qzfiDIY3aWluBag3vC++Vs+VsXt/UquSU5onPMohPih72FUhIhaqmDdMYubOgB3Byl9uF4Vk40JLvQ==";
 
 const defaultStateFile = () => join(homedir(), ".dsh", "copilot-auth-state.json");
 const defaultOverlayFile = () => fileURLToPath(new URL("./catalog-overlay.json", import.meta.url));
@@ -49,7 +53,7 @@ async function readCatalogModelIds(install, log) {
   try {
     const dataFile = install?.catalogFile ?? findCatalogFile();
     if (dataFile) {
-      const data = JSON.parse(readFileSync(dataFile, "utf8"));
+      const data = normalizeRemoteCatalog(JSON.parse(readFileSync(dataFile, "utf8"))).catalog;
       for (const [api, section] of Object.entries(data)) {
         for (const id of Object.keys(section ?? {})) byId[id] ??= api;
       }
@@ -257,7 +261,7 @@ function readLocalCatalog(opts) {
   return {
     file: install.catalogFile,
     bytes,
-    catalog: JSON.parse(bytes.toString("utf8")),
+    catalog: normalizeRemoteCatalog(JSON.parse(bytes.toString("utf8"))).catalog,
     writable: install.writable,
     unwritableReason: install.unwritableReason,
   };
@@ -277,7 +281,7 @@ async function resolveCatalogSource(opts, mode, fetchImpl, allowedKeys) {
       normalized: { renamed: normalized.renamed, skipped: normalized.skipped },
       catalogSource: "overlay",
       catalogError: null,
-      provenance: { kind: "overlay", piAiVersion: OVERLAY_SOURCE_VERSION, integrity: null },
+      provenance: { kind: "overlay", piAiVersion: OVERLAY_SOURCE_VERSION, integrity: OVERLAY_SOURCE_INTEGRITY },
     };
   }
   if (mode !== undefined && mode !== "latest") throw new InvalidModeError(String(mode));
@@ -368,15 +372,17 @@ async function touchRouteIdentity(ctx, log) {
   void log;
   const describe = () => ctx.settings?.describe?.()?.find?.((x) => x?.ns === "llm-pi-ai");
   const first = describe();
-  const route = first?.user?.providers?.["github-copilot"];
-  if (!first || !route || typeof route !== "object" || Array.isArray(route)) return false;
+  const route = first?.user?.providers?.["github-copilot"] ?? {};
+  if (!first || typeof route !== "object" || Array.isArray(route)) return false;
   const hadOwn = Object.prototype.hasOwnProperty.call(route, "displayName");
   const current = hadOwn ? route.displayName : undefined;
   const probeBase = typeof current === "string" && current.length > 0 ? current : "GitHub Copilot";
   const path = ["providers", "github-copilot", "displayName"];
   await ctx.settings.mutate("llm-pi-ai", [{ op: "set", path, value: `${probeBase} ` }], first.revision);
   const second = describe();
-  await ctx.settings.mutate("llm-pi-ai", [hadOwn ? { op: "set", path, value: current } : { op: "unset", path }], second?.revision);
+  // Never overwrite a display-name edit made while the snapshot was rebuilding.
+  if (second?.user?.providers?.["github-copilot"]?.displayName !== `${probeBase} `) return false;
+  await ctx.settings.mutate("llm-pi-ai", [hadOwn ? { op: "set", path, value: current } : { op: "unset", path }], second.revision);
   return true;
 }
 
@@ -541,7 +547,20 @@ export function apply(ctx, opts = {}) {
     } else {
       resolved = await resolveCatalogSource(opts, catalogSource === "overlay" ? "overlay" : undefined, fetchImpl, catalogShapeKeys(local.catalog));
     }
-    const merged = mergeCatalog(local.catalog, resolved.catalog);
+    let logicalLocal = local.catalog;
+    if (!local.writable) {
+      // Do not repeatedly count an already injected overlay as a new directory entry.
+      const registered = await Promise.resolve().then(() => (opts.registryIds ?? registryModelIds)(installInfo, log)).catch(() => null);
+      if (registered) {
+        const registeredIds = new Set(registered);
+        const applied = stateIO.load()?.appliedOverlay ?? {};
+        const activeOverlay = Object.fromEntries(Object.entries(applied).map(([api, section]) => [
+          api, Object.fromEntries(Object.entries(section ?? {}).filter(([id]) => registeredIds.has(id))),
+        ]));
+        logicalLocal = mergeCatalog(logicalLocal, activeOverlay).merged;
+      }
+    }
+    const merged = mergeCatalog(logicalLocal, resolved.catalog);
     const resolvableIds = Object.values(merged.merged).flatMap((s) => Object.keys(s ?? {}));
     return {
       catalogSource: resolved.catalogSource,
@@ -552,6 +571,7 @@ export function apply(ctx, opts = {}) {
       resolvableIds,
       newEntryCount: overlayEntryIds(merged.addedOverlay).length,
       provenance: resolved.provenance,
+      allowedKeys: [...catalogShapeKeys(local.catalog)],
     };
   };
 
@@ -568,6 +588,8 @@ export function apply(ctx, opts = {}) {
     fetchImpl,
   });
   refreshServiceRef = refreshService; // ADR-0006：晚绑定回填（见 onIntentBump）
+  // Optional service: do not prevent login/UI activation in profiles without tools.
+  ctx.inject?.(["tools"], (toolCtx) => registerModelTool(toolCtx, refreshService));
 
   // 启动序列（boot 恢复＋保守激活/自愈，T9 bootRecover）；绝不阻断挂载。
   void refreshService.bootReady()
@@ -691,6 +713,7 @@ export function apply(ctx, opts = {}) {
         }
       }
       json(res, 200, {
+        pluginVersion: PLUGIN_VERSION,
         configured: credential === "present",
         syncError: lastSyncError,
         authorization: {

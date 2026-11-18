@@ -9,7 +9,7 @@
 // refreshGitHubCopilotAccessToken（0.84.4 与 0.87.1 该函数 diff 为空）；ephemeral 使用、绝不落库。
 
 // ↓↓↓ 以下常量抄录自 pi-ai 0.84.4 dist/auth/oauth/github-copilot.js（勿改值）
-const COPILOT_HEADERS = {
+export const COPILOT_HEADERS = {
   "User-Agent": "GitHubCopilotChat/0.35.0",
   "Editor-Version": "vscode/1.107.0",
   "Editor-Plugin-Version": "copilot-chat/0.35.0",
@@ -54,44 +54,101 @@ export function copilotBaseUrl(access, enterpriseUrl) {
 }
 
 function asRecord(value) {
-  return value && typeof value === "object" ? value : undefined;
+  return value && typeof value === "object" && !Array.isArray(value) ? value : undefined;
 }
 
-// 抄录语义（仅 availableModelIds 部分；policyModelIds 涉及 policy 修改，本适配不实现）：
-// tool_calls === false 前置排除；pickerEnabled === true && policyState !== "disabled"
-// 为主集；仅当 individual 端点且主集为空时回退 policyState === "enabled"。
-function parseAvailableModelIds(raw, allowPolicyFallback) {
-  const data = asRecord(raw)?.data;
-  if (!Array.isArray(data)) {
-    throw new Error("Invalid Copilot models response");
+function safeText(value, maxLength = 256) {
+  return typeof value === "string" && value.length <= maxLength && !/[\u0000-\u001f\u007f]/.test(value)
+    ? value : undefined;
+}
+
+// No raw response object is retained. The nested allowlists are intentional:
+// credentials, arbitrary headers/URLs, billing blobs and unknown fields must not
+// leak through a diagnostic response or become persistent catalog metadata.
+function sanitizeModel(item) {
+  const out = { id: item.id };
+  for (const key of ["name", "vendor", "version"]) {
+    const value = safeText(item[key]);
+    if (value !== undefined) out[key] = value;
   }
+  if (typeof item.model_picker_enabled === "boolean") out.model_picker_enabled = item.model_picker_enabled;
+  const policy = asRecord(item.policy);
+  const policyState = safeText(policy?.state, 64);
+  if (policyState !== undefined) out.policy = { state: policyState };
+  const capabilities = asRecord(item.capabilities);
+  if (capabilities) {
+    const caps = {};
+    for (const key of ["type", "family", "tokenizer"]) {
+      const value = safeText(capabilities[key]);
+      if (value !== undefined) caps[key] = value;
+    }
+    const limits = asRecord(capabilities.limits);
+    if (limits) {
+      caps.limits = {};
+      for (const key of ["max_context_window_tokens", "max_prompt_tokens", "max_output_tokens"]) {
+        if (typeof limits[key] === "number" && Number.isFinite(limits[key])) caps.limits[key] = limits[key];
+      }
+    }
+    const supports = asRecord(capabilities.supports);
+    if (supports) {
+      caps.supports = {};
+      for (const key of ["tool_calls", "parallel_tool_calls", "streaming", "vision", "prediction", "thinking", "adaptive_thinking"]) {
+        if (typeof supports[key] === "boolean") caps.supports[key] = supports[key];
+      }
+      for (const key of ["max_thinking_budget", "min_thinking_budget"]) {
+        if (typeof supports[key] === "number" && Number.isFinite(supports[key])) caps.supports[key] = supports[key];
+      }
+      if (Array.isArray(supports.reasoning_effort)) {
+        caps.supports.reasoning_effort = supports.reasoning_effort.slice(0, 16)
+          .filter((value) => ["none", "minimal", "low", "medium", "high", "xhigh", "max"].includes(value));
+      }
+    }
+    out.capabilities = caps;
+  }
+  if (Array.isArray(item.supported_endpoints)) {
+    // Keep unknown paths so the converter can explicitly reject future protocols,
+    // but never trust a returned URL as a base URL or send credentials to it.
+    const endpoints = item.supported_endpoints.map((value) => safeText(value, 128));
+    out.supported_endpoints = endpoints.length > 16 || endpoints.some((value) => value === undefined)
+      ? ["<invalid-supported-endpoints>"] : endpoints;
+  }
+  return out;
+}
+
+// Existing availability policy is unchanged: tool_calls === false is excluded;
+// picker true + policy not disabled wins. Only an empty Individual primary set
+// permits policy.state === enabled fallback. Metadata conversion is stricter.
+function parseLiveModelCatalog(raw, allowPolicyFallback) {
+  const data = asRecord(raw)?.data;
+  if (!Array.isArray(data)) throw new Error("Invalid Copilot models response");
+  const diagnostics = [];
   const accountModels = data.flatMap((rawItem) => {
     const item = asRecord(rawItem);
-    const id = item?.id;
-    if (!item || typeof id !== "string") return [];
-    const capabilities = asRecord(item.capabilities);
-    const supports = asRecord(capabilities?.supports);
-    if (supports?.tool_calls === false) return [];
-    return [
-      {
-        id,
-        pickerEnabled: item.model_picker_enabled === true,
-        policyState: asRecord(item.policy)?.state,
-      },
-    ];
+    if (!item || safeText(item.id) === undefined || item.id.length === 0) {
+      diagnostics.push({ id: null, reason: "invalid-model-id" });
+      return [];
+    }
+    if (asRecord(asRecord(item.capabilities)?.supports)?.tool_calls === false) {
+      diagnostics.push({ id: item.id, reason: "tool-calls-disabled" });
+      return [];
+    }
+    return [item];
   });
-  const pickerModelIds = accountModels
-    .filter((model) => model.pickerEnabled && model.policyState !== "disabled")
-    .map((model) => model.id);
-  return pickerModelIds.length > 0 || !allowPolicyFallback
-    ? pickerModelIds
-    : accountModels.filter((model) => model.policyState === "enabled").map((model) => model.id);
+  const primary = accountModels.filter((item) => item.model_picker_enabled === true
+    && asRecord(item.policy)?.state !== "disabled");
+  const selected = primary.length > 0 || !allowPolicyFallback
+    ? primary : accountModels.filter((item) => asRecord(item.policy)?.state === "enabled");
+  const selectedSet = new Set(selected);
+  for (const item of accountModels) {
+    if (!selectedSet.has(item)) diagnostics.push({ id: item.id, reason: "not-account-available" });
+  }
+  const ids = [...new Set(selected.map((item) => item.id))];
+  return { ids, models: selected.map(sanitizeModel), diagnostics };
 }
 
-// 现场拉取账号可用模型。credential 为 GrantRecord payload：
-// { access, enterpriseUrl?, availableModelIds? }。5s 超时、不重试（对齐 0.84.4
-// token 刷新路径 maxRetries: 0 的行为）；任何失败抛错，由调用方回退凭证缓存。
-export async function fetchLiveAvailableModelIds({ credential, fetchImpl } = {}) {
+// Read-only live metadata fetch; same credentials, headers, policy and 5s timeout
+// as the former IDs-only path. No OAuth/policy mutations or persistent writes.
+export async function fetchLiveModelCatalog({ credential, fetchImpl } = {}) {
   const access = credential?.access;
   if (!access || typeof fetchImpl !== "function") {
     throw new Error("credential.access and fetchImpl required");
@@ -113,7 +170,12 @@ export async function fetchLiveAvailableModelIds({ credential, fetchImpl } = {})
     // 携 status 供调用方证据分型（401/403 → token-rejected；其余 → network），与 refreshEphemeralAccess 同款
     throw Object.assign(new Error(`${response.status} ${response.statusText}: GET ${baseUrl}/models`), { status: response.status });
   }
-  return parseAvailableModelIds(await response.json(), allowPolicyFallback);
+  return parseLiveModelCatalog(await response.json(), allowPolicyFallback);
+}
+
+// Compatibility for callers which need availability evidence but not metadata.
+export async function fetchLiveAvailableModelIds(options = {}) {
+  return (await fetchLiveModelCatalog(options)).ids;
 }
 
 // 本地解析 access（tid 会话令牌）内的 exp=（秒 → 毫秒）；缺失/不可解析 → null。

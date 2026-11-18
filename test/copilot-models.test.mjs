@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { copilotBaseUrl, fetchLiveAvailableModelIds, parseAccessExpiryMs, refreshEphemeralAccess } from "../src/copilot-models.mjs";
+import { copilotBaseUrl, fetchLiveAvailableModelIds, fetchLiveModelCatalog, parseAccessExpiryMs, refreshEphemeralAccess } from "../src/copilot-models.mjs";
 
 const INDIVIDUAL_TOKEN = "tid=1;exp=2;proxy-ep=proxy.individual.githubcopilot.com;";
 const PLAIN_TOKEN = "tid=1;exp=2;"; // 无 proxy-ep
@@ -121,6 +121,68 @@ test("非 200 → 抛错（调用方回退 cache）；响应非 data 数组 → 
 
 test("无 access → 抛错（调用方回退 cache）", async () => {
   await assert.rejects(fetchLiveAvailableModelIds({ credential: {}, fetchImpl: async () => jsonRes({}) }));
+});
+
+test("metadata API retains strictly allowlisted nested capabilities and never credential/raw secrets", async () => {
+  const item = {
+    id: "new-model", name: "New Model", vendor: "Vendor", version: "2026-11-18", model_picker_enabled: true,
+    policy: { state: "enabled", access_token: "DO-NOT-RETURN" }, supported_endpoints: ["/responses"],
+    capabilities: {
+      type: "chat", family: "new-model", tokenizer: "test-tokenizer", token: "DO-NOT-RETURN",
+      limits: { max_context_window_tokens: 10000, max_prompt_tokens: 9000, max_output_tokens: 1000, token: "DO-NOT-RETURN" },
+      supports: { tool_calls: true, streaming: true, vision: false, reasoning_effort: ["low", "high", "DO-NOT-RETURN"], token: "DO-NOT-RETURN" },
+    },
+    headers: { Authorization: "DO-NOT-RETURN" }, billing: { token: "DO-NOT-RETURN" }, access: "DO-NOT-RETURN",
+  };
+  const raw = { data: [item], access: "DO-NOT-RETURN" };
+  const fetchImpl = async () => jsonRes(raw);
+  const result = await fetchLiveModelCatalog({ credential: { access: "DO-NOT-RETURN" }, fetchImpl });
+  assert.deepEqual(result.ids, ["new-model"]);
+  assert.deepEqual(result.diagnostics, []);
+  assert.deepEqual(result.models, [{
+    id: "new-model", name: "New Model", vendor: "Vendor", version: "2026-11-18", model_picker_enabled: true,
+    policy: { state: "enabled" }, supported_endpoints: ["/responses"],
+    capabilities: {
+      type: "chat", family: "new-model", tokenizer: "test-tokenizer",
+      limits: { max_context_window_tokens: 10000, max_prompt_tokens: 9000, max_output_tokens: 1000 },
+      supports: { tool_calls: true, streaming: true, vision: false, reasoning_effort: ["low", "high"] },
+    },
+  }]);
+  assert.equal(JSON.stringify(result).includes("DO-NOT-RETURN"), false);
+  result.models[0].capabilities.limits.max_output_tokens = 8;
+  result.models[0].supported_endpoints.push("/v1/messages");
+  assert.equal(item.capabilities.limits.max_output_tokens, 1000, "sanitized nested objects are independent");
+  assert.deepEqual(item.supported_endpoints, ["/responses"]);
+  assert.deepEqual(await fetchLiveAvailableModelIds({ credential: { access: "x" }, fetchImpl }), result.ids);
+});
+
+test("metadata selection keeps Individual policy fallback and Enterprise exclusion exactly", async () => {
+  const data = [
+    { id: "fallback", model_picker_enabled: false, policy: { state: "enabled" } },
+    { id: "disabled", model_picker_enabled: true, policy: { state: "disabled" } },
+    { id: "no-tools", model_picker_enabled: true, capabilities: { supports: { tool_calls: false } } },
+    null, { id: 5 },
+  ];
+  const fetchImpl = async () => jsonRes({ data });
+  const individual = await fetchLiveModelCatalog({ credential: { access: INDIVIDUAL_TOKEN }, fetchImpl });
+  assert.deepEqual(individual.ids, ["fallback"]);
+  assert.deepEqual(individual.models.map((m) => m.id), ["fallback"]);
+  assert.ok(individual.diagnostics.some((d) => d.id === "no-tools" && d.reason === "tool-calls-disabled"));
+  assert.ok(individual.diagnostics.some((d) => d.id === "disabled" && d.reason === "not-account-available"));
+  const enterprise = await fetchLiveModelCatalog({ credential: { access: PLAIN_TOKEN, enterpriseUrl: "acme.ghe.com" }, fetchImpl });
+  assert.deepEqual(enterprise.ids, []);
+  assert.deepEqual(enterprise.models, []);
+});
+
+test("malformed endpoint fields are poisoned for conservative conversion instead of losing conflict evidence", async () => {
+  const fetchImpl = async () => jsonRes({ data: [
+    { id: "bad", model_picker_enabled: true, supported_endpoints: ["/responses", null] },
+    { id: "future", model_picker_enabled: true, supported_endpoints: ["/future/unsupported"] },
+  ] });
+  const result = await fetchLiveModelCatalog({ credential: { access: INDIVIDUAL_TOKEN }, fetchImpl });
+  assert.deepEqual(result.ids, ["bad", "future"]);
+  assert.deepEqual(result.models[0].supported_endpoints, ["<invalid-supported-endpoints>"]);
+  assert.deepEqual(result.models[1].supported_endpoints, ["/future/unsupported"]);
 });
 
 // ---- v1.2.21：exp 解析与 ephemeral 续期（计划 Task 1）----

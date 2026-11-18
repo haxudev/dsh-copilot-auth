@@ -8,8 +8,7 @@
 // bootRecover 同时承担 v1 boot 的保守激活/自愈职责（等价迁移）与 restartState 清理。
 // failpoint 仅测试注入（opts.failpoint(name) 在命名边界抛错模拟崩溃窗口）。
 import { writeJsonAtomic } from "./atomic-json.mjs";
-import { mergeCatalog, digest } from "./catalog.mjs";
-import { catalogShapeKeys } from "./catalog.mjs";
+import { mergeCatalog, mergeCatalogForDisk, normalizeRemoteCatalog, digest, catalogShapeKeys } from "./catalog.mjs";
 import { restartMarker, setRefreshError, clearRefreshError } from "./state.mjs";
 
 const MODELS_PATH = ["providers", "github-copilot", "models"];
@@ -69,7 +68,7 @@ export function createTransaction(ctx, {
   };
   const diskIds = () => {
     try {
-      const disk = deps.readDiskCatalog();
+      const disk = normalizeRemoteCatalog(deps.readDiskCatalog()).catalog;
       return new Set(Object.values(disk).flatMap((s) => Object.keys(s ?? {})));
     } catch {
       return new Set();
@@ -104,7 +103,8 @@ export function createTransaction(ctx, {
   // 落地一次目录增量：可写安装树走原子写盘（只增合并）；只读树走注册表注入。
   // 返回 {ok, wrote, mode, reason}，绝不抛。
   async function landIncrement(overlay) {
-    const merged = mergeCatalog(deps.readDiskCatalog(), overlay);
+    const raw = deps.readDiskCatalog();
+    const merged = install.writable ? mergeCatalogForDisk(raw, overlay) : mergeCatalog(raw, overlay);
     if (merged.added.length === 0) return { ok: true, wrote: false, mode: "none", reason: null, merged };
     if (install.writable) {
       writeJsonAtomic(install.catalogFile, merged.merged);
@@ -135,6 +135,7 @@ export function createTransaction(ctx, {
       intentVersion: snapshot.intentVersion,
       settingsBaseline: { view: snapshot.config.view, revision: snapshot.config.revision },
       targetView: diff.targetView,
+      verificationIds: diff.automaticCatalog === true ? [...(diff.selectedIds ?? [])] : null,
       writeSet,
       pendingOverlay: snapshot.catalog.addedOverlay ?? {},
       provenance: snapshot.catalog.provenance ?? null,
@@ -245,7 +246,7 @@ export function createTransaction(ctx, {
     }
 
     // ---- 验证 ----
-    const targetIds = (active.targetView.models ?? []).map((m) => m?.id).filter(Boolean);
+    const targetIds = active.verificationIds ?? (active.targetView.models ?? []).map((m) => m?.id).filter(Boolean);
     if (!install.writable && (configWrite || writeSet.catalogEntries)) {
       // registry：宿主 listModels 端到端复核（注入后宿主快照可能需要净零切换重建）
       let served = await waitForServed(targetIds);
@@ -259,6 +260,15 @@ export function createTransaction(ctx, {
         if (touched) served = await waitForServed(targetIds);
       }
       if (!served.ok) {
+        // Catalog-only supplement never owned configuration: do not touch or
+        // "restore" the user's automatic-mode overrides on verification failure.
+        if (!configWrite) {
+          return terminal(stateIO.load(), {
+            operationId: active.operationId, status: "partial", phase: "catalog-landed",
+            error: `registry-not-served: ${served.missing.join(",")}`,
+            changes: { catalogAdded: writeSet.catalogEntries ? overlayIds(active.pendingOverlay).length : 0, modelsAdded: 0, modelsRemoved: 0 },
+          });
+        }
         // 自证失败：仅当当前配置仍等于本操作写入值才回滚，否则 rollback-conflict 保留用户值
         const now = await deps.describeConfigView();
         const weOwn = canonical(now.view) === canonical({ ...active.targetView });
@@ -436,7 +446,7 @@ export function createTransaction(ctx, {
         if (install?.writable === true && a.writeSet?.catalogEntries && configWrite) {
           // file 通道延迟提交：目录已加载（新进程）→可解析前置→基线 CAS→verified
           const ids = await servedIds();
-          const targetIds = (a.targetView.models ?? []).map((m) => m?.id).filter(Boolean);
+          const targetIds = a.verificationIds ?? (a.targetView.models ?? []).map((m) => m?.id).filter(Boolean);
           const unresolvable = targetIds.filter((id) => !ids.has(id));
           if (unresolvable.length > 0) {
             const next = stateIO.load();
@@ -478,7 +488,7 @@ export function createTransaction(ctx, {
         // changes 语义统一为「已发生的变更」（R2-01）：applied/partial（配置确已落地）按
         // baseline↔target 计数；conflict（配置未写/保留用户值）与目录-only 计 0。
         const residueConfigWrite = a.writeSet?.models || a.writeSet?.modelOverrides;
-        const residueTargetIds = (a.targetView.models ?? []).map((m) => m?.id).filter(Boolean);
+        const residueTargetIds = a.verificationIds ?? (a.targetView.models ?? []).map((m) => m?.id).filter(Boolean);
         const finishResidue = (status, error) => {
           const st = stateIO.load();
           st.activeOperation = null;

@@ -6,7 +6,7 @@
 // MutationObserver 把本节导航行的齿轮替换为单色 Copilot 图标
 // （octicons copilot-16，fill=currentColor，浅/深主题自动一致）。
 import { useEffect, useRef, useState } from "react";
-import { initial as refreshInitial, advance, refreshBlocked } from "./refresh-flow.mjs";
+import { initial as refreshInitial, advance, refreshBlocked, discoveryView } from "./refresh-flow.mjs";
 import { createAuthFlow } from "./auth-flow.mjs";
 
 export const name = "copilot-auth-ui";
@@ -49,6 +49,44 @@ const DICTS = {
     logoutFailed: "Sign-out did not complete; authorization credentials may remain. Please retry.",
     // ---- Model management (protocol v3, design §5 / ADR 0005) ----
     manageModels: "Manage model list",
+    supplementModels: "Only add latest models",
+    supplementPreview: "Preview model additions",
+    automaticCatalog: "Your model list uses the full catalog automatically. This preview only supplements catalog data and preserves that mode and customizations. Use Manage model list to choose a smaller list.",
+    supplementHint: "Preselects current models plus available, resolvable account models, keeping customizations. Review before applying; manual edits can change this selection.",
+    localBuild: "Local build {version}",
+    discoveryCounts: "Account reported {account} / Resolvable {resolvable} / {additions} {added}",
+    discoveryLive: "Discovery: live account metadata",
+    discoveryCache: "Discovery: cached account metadata (not verified live)",
+    discoveryStale: "Discovery: stale metadata — reference only; not trusted for automatic catalog additions",
+    discoveryUnknown: "Discovery: source unknown; not verified live",
+    discoveryLiveAdded: "Live catalog additions",
+    discoveryCacheAdded: "Cached catalog additions",
+    discoveryStaleAdded: "Stale catalog candidates",
+    discoveryUnknownAdded: "Catalog candidates (source unknown)",
+    discoveryAddedTitle: "Account-discovered catalog additions",
+    discoveryUnresolvedTitle: "Not connected automatically",
+    discoverySafety: "Only supported chat models with tool support and an allowed protocol can be added automatically. Policy-disabled or insufficiently described models are not connected.",
+    discoveryUnknownReason: "Cannot safely connect automatically; see the reported reason code",
+    discoveryReasons: {
+      "invalid-model-id": "The model ID is invalid or unsafe.",
+      "not-account-available": "Not in this account's live available model set.",
+      "duplicate-model-id": "Duplicate model ID; the metadata is not unique.",
+      "chat-capability-not-confirmed": "Chat capability was not explicitly confirmed.",
+      "streaming-not-confirmed": "Streaming support was not explicitly confirmed; this host requires streaming responses.",
+      "tool-calls-not-confirmed": "Tool-calling support was not explicitly confirmed.",
+      "tool-calls-disabled": "Tool calling is disabled for this model.",
+      "policy-disabled": "The model is disabled by account policy.",
+      "missing-supported-endpoints": "The response did not declare supported endpoints.",
+      "unknown-supported-endpoint": "The declared endpoint protocol is not supported.",
+      "unsupported-websocket-only-endpoint": "Only a WebSocket endpoint was reported; it cannot be connected here.",
+      "ambiguous-supported-endpoints": "The reported endpoint protocols are ambiguous or conflicting.",
+      "missing-or-invalid-context-window": "The context window is missing or invalid.",
+      "missing-or-invalid-output-limit": "The output token limit is missing or invalid.",
+      "inconsistent-token-limits": "The prompt/output limits conflict with the total context window.",
+      "live-metadata-unavailable": "Only cached or stale metadata is available; live metadata is required to supplement the catalog.",
+      "metadata-unavailable": "The live response did not include enough model metadata to connect safely.",
+    },
+    countUnknown: "unknown",
     selectAll: "Select all",
     selectNone: "Deselect all",
     alignAction: "Align with account & catalog",
@@ -70,6 +108,9 @@ const DICTS = {
     removedUnresolvable: "Not resolvable by the current catalog",
     skippedModels: "Upstream entries skipped by validation",
     srcLive: "Account models: live",
+    srcUnknown: "Account models: source unknown; availability is unverified",
+    catalogUnknown: "Catalog source: unknown; latest version is unverified",
+    piAiVersion: "pi-ai {version}",
     srcCache: "Account models: cached at {time}; removals require upgrading to live evidence",
     srcCacheExpired: "Account models: cached at {time}. The session token is expired and could not be auto-renewed — chat with any Copilot model once; if it still fails, sign out and authorize again.",
     srcCacheRejected: "Account models: cached at {time}. The local token was rejected by GitHub (possibly re-authorized on another device) — sign out and authorize again.",
@@ -77,7 +118,7 @@ const DICTS = {
     srcCacheNoSession: "Account models: cached at {time}. No local session token — authorize first.",
     srcStale: "The cache has no trusted timestamp, is expired, or belongs to changed authorization; reference only.",
     srcLatest: "Catalog source: latest pi-ai from npm",
-    srcLocal: "Catalog source: local (npm fetch failed)",
+    srcLocal: "Catalog source: local fallback (not verified as latest)",
     srcOverlay: "Catalog source: bundled overlay (offline bootstrap)",
     overlayBtn: "Preview with bundled overlay",
     previewStale: "Configuration or data changed. Preview and confirm again.",
@@ -145,6 +186,44 @@ const DICTS = {
     logoutFailed: "退出登录未完成，授权凭据仍可能存在。请重试。",
     // ---- 模型管理（协议 v3，设计§5 / ADR 0005） ----
     manageModels: "管理模型列表",
+    supplementModels: "只补充最新模型",
+    supplementPreview: "预览补充模型",
+    automaticCatalog: "当前模型列表自动使用全目录。本次仅补充目录数据，保留此模式与定制；如需精简模型，请使用“管理模型列表”。",
+    supplementHint: "预选保留当前模型，并补充账号可用且目录可解析的模型，保留定制。请预览后再应用；手动调整可能改变此选择。",
+    localBuild: "本地版本 {version}",
+    discoveryCounts: "账号报告 {account} / 可接入 {resolvable} / {additions} {added}",
+    discoveryLive: "模型发现：实时账号元数据",
+    discoveryCache: "模型发现：缓存账号元数据（未经实时核实）",
+    discoveryStale: "模型发现：过期元数据，仅供参考；不用于自动补目录",
+    discoveryUnknown: "模型发现：来源未知，未经实时核实",
+    discoveryLiveAdded: "实时补目录",
+    discoveryCacheAdded: "缓存补目录",
+    discoveryStaleAdded: "过期待核实目录候选",
+    discoveryUnknownAdded: "来源未知目录候选",
+    discoveryAddedTitle: "账号发现的补目录模型",
+    discoveryUnresolvedTitle: "未自动接入",
+    discoverySafety: "仅自动接入支持工具调用、协议受支持的聊天模型；策略禁用、非聊天、不支持工具或描述不足的模型不会自动接入。",
+    discoveryUnknownReason: "暂不能安全自动接入，请查看返回的原因代码",
+    discoveryReasons: {
+      "invalid-model-id": "模型 ID 不合法或不安全。",
+      "not-account-available": "不在该账号实时可用的模型集合中。",
+      "duplicate-model-id": "模型 ID 重复，无法唯一确定元数据。",
+      "chat-capability-not-confirmed": "尚未明确确认支持聊天。",
+      "streaming-not-confirmed": "尚未明确确认支持流式响应；当前宿主要求使用流式响应。",
+      "tool-calls-not-confirmed": "尚未明确确认支持工具调用。",
+      "tool-calls-disabled": "该模型已禁用工具调用。",
+      "policy-disabled": "该模型已被账号策略禁用。",
+      "missing-supported-endpoints": "响应未声明支持的端点。",
+      "unknown-supported-endpoint": "声明的端点协议尚不受支持。",
+      "unsupported-websocket-only-endpoint": "仅报告 WebSocket 端点，当前无法接入。",
+      "ambiguous-supported-endpoints": "报告的端点协议存在歧义或冲突。",
+      "missing-or-invalid-context-window": "上下文窗口缺失或不合法。",
+      "missing-or-invalid-output-limit": "输出 token 限额缺失或不合法。",
+      "inconsistent-token-limits": "输入或输出限额与总上下文窗口矛盾。",
+      "live-metadata-unavailable": "仅有缓存或过期元数据，须取得实时元数据后才能补目录。",
+      "metadata-unavailable": "实时响应缺少足够的模型描述，暂不能安全接入。",
+    },
+    countUnknown: "未知",
     selectAll: "全选",
     selectNone: "取消全选",
     alignAction: "对齐账号与目录",
@@ -166,6 +245,9 @@ const DICTS = {
     removedUnresolvable: "目录无法解析",
     skippedModels: "被校验跳过的上游条目",
     srcLive: "账号模型：实时获取",
+    srcUnknown: "账号模型：来源未知，可用性待核实",
+    catalogUnknown: "目录来源：未知，未确认是否为最新版本",
+    piAiVersion: "pi-ai {version}",
     srcCache: "账号模型：缓存，获取于 {time}；移除类更改需升级为实时证据",
     srcCacheExpired: "账号模型：缓存，获取于 {time}。会话令牌已过期，未能自动续期——先用任一 Copilot 模型对话一次；若仍失败，请退出登录并重新授权。",
     srcCacheRejected: "账号模型：缓存，获取于 {time}。本地令牌被 GitHub 拒绝（可能已在另一台设备重新授权）——请退出登录并重新授权。",
@@ -173,7 +255,7 @@ const DICTS = {
     srcCacheNoSession: "账号模型：缓存，获取于 {time}。本地无会话令牌——请先完成授权。",
     srcStale: "缓存缺少可信时间、已过期或授权已变化，仅供参考。",
     srcLatest: "目录来源：npm 最新 pi-ai",
-    srcLocal: "目录来源：本地目录（npm 拉取失败）",
+    srcLocal: "目录来源：本地兜底（未确认是否为最新版本）",
     srcOverlay: "目录来源：内置覆盖层（离线 bootstrap）",
     overlayBtn: "改用内置目录数据预览",
     previewStale: "配置或数据已变化，请重新预览并确认。",
@@ -346,6 +428,7 @@ function cacheCopyKey(reason) {
 // 危险确认初始焦点在取消、Esc 等价取消（设计§5）；技术详情默认折叠（G04）。
 function RefreshModal({ t, flow, onSelect, onConfirm, onCancel, onOverlay }) {
   const p = flow.preview;
+  const discovery = discoveryView(p);
   const isStale = p.evidence?.stale === true;
   const degradedCatalog = p.catalogSource === "local" || p.catalogSource === "overlay";
   const locked = isStale || degradedCatalog; // 降级来源：待删除候选锁定保留（Q33）
@@ -388,8 +471,9 @@ function RefreshModal({ t, flow, onSelect, onConfirm, onCancel, onOverlay }) {
   const removedCount = rawAllIds.length - keptCount;
   const total = keptCount + addedCount;
   const emptyTarget = confirmEmptyOf(selected);
-  const applyBlocked = isStale || (removedCount > 0 && (p.evidence?.source !== "live" || degradedCatalog));
+  const applyBlocked = flow.materializing || isStale || (removedCount > 0 && (p.evidence?.source !== "live" || degradedCatalog));
   const cancelRef = useRef(null);
+  useEffect(() => { cancelRef.current?.focus(); }, []);
   const surface = useRef(null);
   if (!surface.current) surface.current = sampleThemeSurface();
   const escCancel = (e) => { if (e.key === "Escape") onCancel(); };
@@ -400,8 +484,10 @@ function RefreshModal({ t, flow, onSelect, onConfirm, onCancel, onOverlay }) {
   };
   const sourceLine = [
     p.evidence?.source === "live" ? t("srcLive")
-      : p.evidence?.source === "cache" ? (cacheCopyKey(p.evidence?.reason) ? t(cacheCopyKey(p.evidence?.reason)) : t("srcCache")).replace("{time}", String(p.evidence?.fetchedAt ?? "")) : null,
-    p.catalogSource === "latest" ? t("srcLatest") : p.catalogSource === "overlay" ? t("srcOverlay") : t("srcLocal"),
+      : p.evidence?.source === "cache" ? (cacheCopyKey(p.evidence?.reason) ? t(cacheCopyKey(p.evidence?.reason)) : t("srcCache")).replace("{time}", String(p.evidence?.fetchedAt ?? "")) : t("srcUnknown"),
+    p.catalogSource === "latest" ? t("srcLatest") : p.catalogSource === "overlay" ? t("srcOverlay") : p.catalogSource === "local" ? t("srcLocal") : t("catalogUnknown"),
+    p.provenance?.piAiVersion ? t("piAiVersion").replace("{version}", String(p.provenance.piAiVersion)) : null,
+    discovery ? t({ live: "discoveryLive", cache: "discoveryCache", stale: "discoveryStale", unknown: "discoveryUnknown" }[discovery.source]) : null,
   ].filter(Boolean).join(" · ");
   const groupDefs = [
     { key: "groupAddable", items: rows.filter((r) => r.status === "addable") },
@@ -409,11 +495,12 @@ function RefreshModal({ t, flow, onSelect, onConfirm, onCancel, onOverlay }) {
     { key: "groupRemoval", items: removalRows, retain: true },
   ];
   return (
-    <div style={styles.modalMask} role="dialog" aria-modal="true" onKeyDown={escCancel}>
+    <div style={styles.modalMask} role="dialog" aria-modal="true" aria-label={t(flow.selectionMode === "supplement" ? "supplementPreview" : "manageModels")} onKeyDown={escCancel}>
       {/* 固定高度＋三段式（头部/可滚动内容/常驻操作栏）：勾选与物化往返不改变卡片尺寸 */}
       <div style={{ ...styles.modal, background: surface.current.bg, color: surface.current.fg, height: "min(80vh, 680px)", padding: 0, overflow: "hidden" }}>
         <div style={{ padding: "18px 20px 6px" }}>
-          <h4 style={styles.modalTitle}>{t("manageModels")}</h4>
+          <h4 style={styles.modalTitle}>{t(flow.selectionMode === "supplement" ? "supplementPreview" : "manageModels")}</h4>
+          {flow.selectionMode === "supplement" && <p style={styles.modalText}>{t(p.automaticCatalog ? "automaticCatalog" : "supplementHint")}</p>}
           {/* staleNotice 双语义分流（R1-4/R2-1）：「可应用的缓存态」（有效缓存＋latest 目录）
               下一律不显示 previewStale——纯新增可正常应用（删除类的知情由 removalNeedsLive
               横幅承担）；其余（apply-stale 重预览、stale 证据等）维持「请重新预览并确认」 */}
@@ -422,8 +509,36 @@ function RefreshModal({ t, flow, onSelect, onConfirm, onCancel, onOverlay }) {
           {isStale && <p style={styles.banner}>⚠ {t("srcStale")}</p>}
         </div>
         <div style={{ flex: 1, overflowY: "auto", minHeight: 0, scrollbarGutter: "stable", padding: "0 20px" }}>
+          {discovery && (
+            <section aria-label={t("discoveryAddedTitle")} style={{ color: "var(--dsw-alias-label-primary, inherit)", padding: "6px 0 12px" }}>
+              <p style={{ ...styles.modalText, fontWeight: 600 }}>
+                {t("discoveryCounts")
+                  .replace("{account}", discovery.accountCount === null ? t("countUnknown") : String(discovery.accountCount))
+                  .replace("{resolvable}", discovery.resolvableCount === null ? t("countUnknown") : String(discovery.resolvableCount))
+                  .replace("{additions}", t({ live: "discoveryLiveAdded", cache: "discoveryCacheAdded", stale: "discoveryStaleAdded", unknown: "discoveryUnknownAdded" }[discovery.source]))
+                  .replace("{added}", String(discovery.added.length))}
+              </p>
+              <p style={{ ...styles.modalText, fontSize: 12 }}>{t("discoverySafety")}</p>
+              {discovery.added.length > 0 && (
+                <details style={styles.modalText}>
+                  <summary>{t("discoveryAddedTitle")} ({discovery.added.length})</summary>
+                  <ul style={{ ...styles.diffList, overflowWrap: "anywhere" }}>
+                    {discovery.added.map((entry, i) => <li key={entry.id ?? i}><span style={styles.mono}>{String(entry.id ?? "")}</span> — {String(entry.api ?? t("countUnknown"))}</li>)}
+                  </ul>
+                </details>
+              )}
+              {discovery.unresolved.length > 0 && (
+                <details open style={styles.modalText}>
+                  <summary>{t("discoveryUnresolvedTitle")} ({discovery.unresolved.length})</summary>
+                  <ul style={{ ...styles.diffList, overflowWrap: "anywhere" }}>
+                    {discovery.unresolved.map((entry, i) => <li key={entry.id ?? i}><span style={styles.mono}>{String(entry.id ?? "")}</span> — {typeof t("discoveryReasons")?.[entry.reason] === "string" ? t("discoveryReasons")[entry.reason] : t("discoveryUnknownReason")} <span style={styles.mono}>({String(entry.reason ?? "unknown")})</span></li>)}
+                  </ul>
+                </details>
+              )}
+            </section>
+          )}
           {/* 工具行：全选/取消全选作用于全表（含待删除候选＝全部挽留）；对齐仅在漂移时出现（Q36） */}
-          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", padding: "6px 0" }}>
+          {!p.automaticCatalog && <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", padding: "6px 0" }}>
             <button type="button" style={{ ...styles.button, ...styles.secondary, height: 24, fontSize: 12 }}
               onClick={() => emitSel(new Set([...addableIds, ...rawAllIds]))}>{t("selectAll")}</button>
             <button type="button" style={{ ...styles.button, ...styles.secondary, height: 24, fontSize: 12 }}
@@ -434,7 +549,7 @@ function RefreshModal({ t, flow, onSelect, onConfirm, onCancel, onOverlay }) {
                 onClick={() => emitSel(new Set([...addableIds, ...rows.filter((r) => r.status === "listed").map((r) => r.id)]))}
               >{t("alignAction")}</button>
             )}
-          </div>
+          </div>}
           {groupDefs.map(({ key, items, retain }) => items.length === 0 ? null : (
             <div key={key} style={{ marginBottom: 8 }}>
               <p style={{ ...styles.modalText, fontWeight: 600, margin: "6px 0 2px" }} title={retain ? t("retain") : undefined}>
@@ -445,7 +560,7 @@ function RefreshModal({ t, flow, onSelect, onConfirm, onCancel, onOverlay }) {
                 const checked = forceKept || selected.has(r.id);
                 return (
                   <label key={r.id} style={{ display: "flex", gap: 8, alignItems: "center", padding: "2px 0" }}>
-                    <input type="checkbox" checked={checked} disabled={forceKept} onChange={() => toggle(r.id)} />
+                    <input type="checkbox" checked={checked} disabled={forceKept || p.automaticCatalog === true} onChange={() => toggle(r.id)} />
                     <span style={styles.mono}>{r.id}</span>
                     {r.status === "removal-proposal" && (
                       <span style={{ ...styles.removed, fontSize: 12 }}>{t(r.reason === "unresolvable" ? "removedUnresolvable" : "removedAccount")}</span>
@@ -456,7 +571,7 @@ function RefreshModal({ t, flow, onSelect, onConfirm, onCancel, onOverlay }) {
               })}
             </div>
           ))}
-          {(p.overridesMeta?.clearable || p.overridesMeta?.inheritedOnly) && (
+          {!p.automaticCatalog && (p.overridesMeta?.clearable || p.overridesMeta?.inheritedOnly) && (
             <div style={{ padding: "4px 0" }}>
               <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
                 <input type="checkbox" checked={coChecked} disabled={!p.overridesMeta?.clearable} onChange={(e) => toggleClearOverrides(e.target.checked)} />
@@ -524,7 +639,7 @@ function RefreshModal({ t, flow, onSelect, onConfirm, onCancel, onOverlay }) {
               disabled={applyBlocked}
               onClick={confirmClick}
             >
-              {t("applyChanges")}
+              {flow.materializing ? t("refreshing") : t("applyChanges")}
             </button>
           </div>
         </div>
@@ -657,7 +772,10 @@ function CopilotSection({ t = (key) => DICTS.en[key] ?? key }) {
 
   return (
     <div style={styles.section}>
-      <h3 style={styles.title}>{t("title")}</h3>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap" }}>
+        <h3 style={styles.title}>{t("title")}</h3>
+        <span style={{ ...styles.muted, fontSize: 12, color: "var(--dsw-alias-label-primary, inherit)" }}>{t("localBuild").replace("{version}", "1.4.1-local.1")}</span>
+      </div>
       <p style={styles.intro}>{t("intro")}</p>
       <div style={styles.badgeRow}>
         <span style={{ ...styles.dot, background: badgeColor[phase] ?? "#adb5bd" }} />
@@ -754,16 +872,28 @@ function CopilotSection({ t = (key) => DICTS.en[key] ?? key }) {
                 {flow.name === "applying" ? t("applying") : t("refreshing")}
               </button>
             ) : (
+              <>
               <button
                 type="button"
-                style={{ ...styles.button, ...styles.primary, ...(refreshBlocked(flow.flags) ? { opacity: 0.5, cursor: "not-allowed" } : null) }}
+                style={{ ...styles.button, ...styles.secondary, ...(refreshBlocked(flow.flags) ? { opacity: 0.5, cursor: "not-allowed" } : null) }}
                 disabled={refreshBlocked(flow.flags)}
                 onClick={() => drive({ type: "start", operation: "manage" })}
               >
                 {t("manageModels")}
               </button>
+              <button
+                type="button"
+                style={{ ...styles.button, background: "var(--dsw-alias-bg-base, transparent)", color: "var(--dsw-alias-label-primary, inherit)", border: "1px solid currentColor", fontWeight: 600, ...(refreshBlocked(flow.flags) ? { opacity: 0.5, cursor: "not-allowed" } : null) }}
+                disabled={refreshBlocked(flow.flags)}
+                title={t("supplementHint")}
+                onClick={() => drive({ type: "start", selectionMode: "supplement" })}
+              >
+                {t("supplementModels")}
+              </button>
+              </>
             )}
           </div>
+          <p style={styles.modalText}>{t("supplementHint")}</p>
           {auth.logoutError && (
             <p style={styles.error}>⚠ {auth.logoutError === "logout-unsafe" ? t("authUnsafe") : t("logoutFailed")}</p>
           )}

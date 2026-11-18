@@ -1,5 +1,7 @@
 # @inventec/dsh-copilot-auth
 
+> **本地二次开发版 `1.4.1-local.1`**（基于上游 `1.2.26`，非 npm 官方发布）：修复“账号有新模型、静态目录却过滤掉”的问题，按实时能力与明确协议接入 GPT-6.2 Sol / Gemini 4 Carbon，并为已实测的 MAI Code 2 / MAI Code 2 Flash 选择 Responses，保留只增同步与定制保护。内置 pi-ai `1.5.2` 静态快照，另提供实时来源、真实计数及未解析原因。安装替换后请完整重启 DSH。功能、验证与限制见 [本地升级说明](docs/LOCAL-UPGRADE.md)。下方保留上游文档与来源，旧截图不代表本地新增界面；其中“只做目录、不实现协议”的上游描述不包含本地受限元数据适配器。
+
 [![npm](https://img.shields.io/npm/v/%40inventec%2Fdsh-copilot-auth?label=npm)](https://www.npmjs.com/package/@inventec/dsh-copilot-auth)
 [![CI](https://img.shields.io/github/actions/workflow/status/iasiv5/dsh-copilot-auth/ci.yml?branch=main&label=CI)](https://github.com/iasiv5/dsh-copilot-auth/actions/workflows/ci.yml)
 [![License](https://img.shields.io/github/license/iasiv5/dsh-copilot-auth?label=License)](https://github.com/iasiv5/dsh-copilot-auth/blob/main/LICENSE)
